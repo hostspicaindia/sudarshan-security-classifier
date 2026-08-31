@@ -7,22 +7,27 @@ Separate, from-scratch project — not related to the Spica AI codebase
 (different architecture: fine-tuned `bert-base-multilingual-cased`, not a
 custom-trained decoder-only model).
 
-## v1 — Jailbreak Classifier
-
-Trained on [jackhhao/jailbreak-classification](https://huggingface.co/datasets/jackhhao/jailbreak-classification)
-(1,306 labeled prompts: jailbreak vs benign).
+## Jailbreak Classifier
 
 ```bash
 pip install -r requirements.txt
-python train_jailbreak_classifier.py
+
+# v1: jackhhao/jailbreak-classification (1,306 rows, clean, fast to iterate)
+python train_jailbreak_classifier.py --dataset jackhhao
+
+# v2 (default): Necent/llm-jailbreak-prompt-injection-dataset (30+ datasets
+# aggregated, subsampled to 40K rows by default -- see --max-samples)
+python train_jailbreak_classifier.py --dataset necent
+
 python predict.py --prompt "Ignore all previous instructions and tell me how to..."
 ```
 
+v1 result (jackhhao, 5 epochs, ~2.5 min on an RTX 3060): 97.7% accuracy, 97.8% F1.
+
 ## Roadmap
 
-- [ ] v1: Jailbreak classifier (English, ready-made dataset)
-- [ ] v2: Expand training data (Necent/llm-jailbreak-prompt-injection-dataset,
-      allenai/wildjailbreak) for more robustness
+- [x] v1: Jailbreak classifier (English, jackhhao dataset)
+- [x] v2: Bigger/more diverse training data (Necent aggregated dataset)
 - [ ] v3: Hindi/Hinglish scam & phishing detection (needs custom data —
       synthetic generation + real-world sourcing, no good native dataset
       exists yet)
