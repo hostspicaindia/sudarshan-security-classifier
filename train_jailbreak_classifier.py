@@ -35,7 +35,7 @@ Usage:
 import argparse
 
 import numpy as np
-from datasets import load_dataset
+from datasets import concatenate_datasets, load_dataset
 from sklearn.metrics import accuracy_score, f1_score, precision_recall_fscore_support
 from transformers import (
     AutoModelForSequenceClassification,
@@ -48,6 +48,12 @@ MODEL_NAME = "bert-base-multilingual-cased"
 LABEL2ID = {"benign": 0, "jailbreak": 1}
 ID2LABEL = {v: k for k, v in LABEL2ID.items()}
 SEED = 42
+
+# v2 test showed the classifier missed every persona/roleplay-style jailbreak
+# (DAN, "pretend you're my grandmother", fictional-framing) despite 96.6% eval
+# F1 -- these sources are only ~7.5% of Necent's adversarial rows naturally,
+# so a flat random subsample barely includes them. v3 oversamples them.
+PRIORITY_SOURCES = {"WildJailbreak", "JailBreakV-28k"}
 
 
 def compute_metrics(eval_pred):
@@ -74,30 +80,49 @@ def load_jackhhao():
     return ds.remove_columns(["type"])
 
 
-def load_necent(max_samples: int):
-    """v2 dataset -- aggregated, needs filtering + our own train/test split.
+def load_necent(max_samples: int, priority_fraction: float):
+    """v3 dataset -- aggregated, needs filtering + stratified subsample + our
+    own train/test split.
 
     prompt_adversarial is the label we want (1 = jailbreak/injection
     technique, 0 = not) -- matches LABEL2ID directly since it's already
     0/1. Rows where it's null (not applicable/not annotated) are dropped
     rather than guessed at.
+
+    Adversarial rows are split into PRIORITY_SOURCES (persona/roleplay
+    jailbreaks) and everything else, then sampled separately so priority
+    sources hit priority_fraction of the adversarial half instead of their
+    natural ~7.5% share.
     """
     print("loading dataset: Necent/llm-jailbreak-prompt-injection-dataset (this is large, may take a while)")
     raw = load_dataset("Necent/llm-jailbreak-prompt-injection-dataset", split="train")
 
     raw = raw.filter(lambda ex: ex["prompt_adversarial"] is not None and ex["prompt"])
     raw = raw.rename_column("prompt_adversarial", "label")
-    raw = raw.select_columns(["prompt", "label"])
+    raw = raw.select_columns(["prompt", "label", "source"])
 
-    n_jailbreak = sum(1 for x in raw["label"] if x == 1)
-    n_benign = len(raw) - n_jailbreak
-    print(f"after filtering: {len(raw)} labeled rows ({n_jailbreak} jailbreak, {n_benign} benign)")
+    adv = raw.filter(lambda ex: ex["label"] == 1)
+    benign = raw.filter(lambda ex: ex["label"] == 0)
+    print(f"after filtering: {len(raw)} labeled rows ({len(adv)} jailbreak, {len(benign)} benign)")
 
-    if len(raw) > max_samples:
-        raw = raw.shuffle(seed=SEED).select(range(max_samples))
-        print(f"subsampled to {max_samples} rows (--max-samples)")
+    adv_target = max_samples // 2
+    benign_target = max_samples - adv_target
 
-    split = raw.train_test_split(test_size=0.1, seed=SEED)
+    priority = adv.filter(lambda ex: ex["source"] in PRIORITY_SOURCES)
+    other = adv.filter(lambda ex: ex["source"] not in PRIORITY_SOURCES)
+
+    priority_target = min(int(adv_target * priority_fraction), len(priority))
+    other_target = min(adv_target - priority_target, len(other))
+    print(f"adversarial sample: {priority_target} priority (persona/roleplay) + {other_target} other")
+
+    priority_sample = priority.shuffle(seed=SEED).select(range(priority_target))
+    other_sample = other.shuffle(seed=SEED).select(range(other_target))
+    benign_sample = benign.shuffle(seed=SEED).select(range(min(benign_target, len(benign))))
+
+    combined = concatenate_datasets([priority_sample, other_sample, benign_sample])
+    combined = combined.remove_columns(["source"]).shuffle(seed=SEED)
+
+    split = combined.train_test_split(test_size=0.1, seed=SEED)
     return split
 
 
@@ -105,6 +130,12 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", choices=["jackhhao", "necent"], default="necent")
     parser.add_argument("--max-samples", type=int, default=40000, help="cap on necent rows used (it's 1M-10M raw)")
+    parser.add_argument(
+        "--priority-fraction",
+        type=float,
+        default=0.3,
+        help="v3: fraction of adversarial rows drawn from persona/roleplay sources (natural rate is ~7.5%%)",
+    )
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--learning-rate", type=float, default=2e-5)
@@ -114,7 +145,7 @@ def main():
     if args.dataset == "jackhhao":
         ds = load_jackhhao()
     else:
-        ds = load_necent(args.max_samples)
+        ds = load_necent(args.max_samples, args.priority_fraction)
 
     print(f"loading tokenizer + model: {MODEL_NAME}")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
